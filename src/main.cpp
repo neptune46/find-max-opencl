@@ -115,6 +115,7 @@ struct Options {
     unsigned seed = 42;    // RNG seed
     bool verbose = true;
     bool csv = false;      // emit CSV summary: size,kernel_ms,passes,wg,items
+    std::string variant = "auto"; // auto | wg (OpenCL 2.0) | local (OpenCL 1.2)
 };
 
 static Options parse_args(int argc, char** argv) {
@@ -130,8 +131,9 @@ static Options parse_args(int argc, char** argv) {
         else if (a == "--seed") { require_value(i); opt.seed = (unsigned)std::strtoul(argv[++i], nullptr, 10); }
         else if (a == "--quiet" || a == "-q") { opt.verbose = false; }
         else if (a == "--csv") { opt.csv = true; }
+        else if (a == "--variant" || a == "-k") { require_value(i); opt.variant = argv[++i]; }
         else if (a == "--help" || a == "-h") {
-            std::cout << "Usage: ocl_find_max [--size N] [--wg W] [--groups-max G] [--seed S] [--quiet] [--csv]\n";
+            std::cout << "Usage: ocl_find_max [--size N] [--wg W] [--groups-max G] [--seed S] [--quiet] [--csv] [--variant auto|wg|local]\n";
             std::exit(0);
         }
     }
@@ -213,11 +215,25 @@ int main(int argc, char** argv) {
 
         bool can_use_wg_reduce = is_opencl_c_ge_20(chosen_device);
         std::string build_opts;
-        if (can_use_wg_reduce) {
-            build_opts = "-cl-std=CL2.0 -DUSE_WG_REDUCE=1";
+        // Decide variant
+        auto tolower_str = [](std::string s){ for(char& c: s) c = (char)std::tolower((unsigned char)c); return s; };
+        std::string var = tolower_str(opt.variant);
+        bool use_wg = false;
+        if (var == "auto") {
+            use_wg = can_use_wg_reduce;
+        } else if (var == "wg" || var == "ocl20" || var == "cl2" || var == "cl20") {
+            if (!can_use_wg_reduce) {
+                std::fprintf(stderr, "Requested variant 'wg' requires OpenCL C 2.0 support.\n");
+                return 1;
+            }
+            use_wg = true;
+        } else if (var == "local" || var == "ocl12" || var == "cl1.2" || var == "cl12") {
+            use_wg = false;
         } else {
-            build_opts = "-cl-std=CL1.2";
+            std::fprintf(stderr, "Unknown --variant value: %s\n", opt.variant.c_str());
+            return 1;
         }
+        if (use_wg) build_opts = "-cl-std=CL2.0 -DUSE_WG_REDUCE=1"; else build_opts = "-cl-std=CL1.2";
         err = clBuildProgram(prog, 1, &chosen_device, build_opts.c_str(), nullptr, nullptr);
         if (err != CL_SUCCESS) {
             size_t log_sz = 0;
@@ -254,7 +270,7 @@ int main(int argc, char** argv) {
             const size_t global = groups * (size_t)wg;
 
             cl_int e = 0;
-            if (can_use_wg_reduce) {
+            if (use_wg) {
                 e = clSetKernelArg(krn, 0, sizeof(cl_mem), &in_buf);
                 e |= clSetKernelArg(krn, 1, sizeof(cl_mem), &out_buf);
                 cl_uint n_arg = (cl_uint)count;
@@ -314,8 +330,9 @@ int main(int argc, char** argv) {
         // Report GPU kernel timing (sum of all passes)
         const double kernel_ms = (double)total_kernel_ns / 1.0e6;
         if (opt.csv) {
-            // CSV: size,kernel_ms,passes,wg,items_per_thread
-            std::printf("%zu,%.6f,%d,%d,%d\n", n, kernel_ms, pass_count, wg, ITEMS_PER_THREAD);
+            // CSV: size,variant,kernel_ms,passes,wg,items_per_thread
+            const char* vstr = use_wg ? "wg" : "local";
+            std::printf("%zu,%s,%.6f,%d,%d,%d\n", n, vstr, kernel_ms, pass_count, wg, ITEMS_PER_THREAD);
         } else if (opt.verbose) {
             std::printf("Kernel passes: %d\n", pass_count);
             std::printf("Total kernel time: %.6f ms\n", kernel_ms);
